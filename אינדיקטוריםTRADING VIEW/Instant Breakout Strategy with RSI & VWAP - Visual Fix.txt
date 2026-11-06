@@ -1,0 +1,83 @@
+//@version=6
+strategy("Instant Breakout Strategy with RSI & VWAP - Visual Fix", overlay=true, scale=scale.none)
+
+// Inputs
+int pivot_left = input.int(3, "Left Pivot Bars", minval=1)
+int pivot_right = input.int(3, "Right Pivot Bars", minval=1)
+float vol_multiplier = input.float(1.5, "Volume Surge Multiplier", minval=1.0)
+float mom_threshold = input.float(0.01, "Momentum Threshold", minval=0.0)
+float tp_multiplier = input.float(9.0, "Take-Profit ATR Multiplier", minval=0.5)
+float sl_multiplier = input.float(1.0, "Stop-Loss ATR Multiplier", minval=0.5)
+bool use_filters = input.bool(false, "Use Volume/Momentum Filters")
+
+// Visual settings
+bool show_levels = input.bool(true, "Show Support / Resistance", group="Visual")
+bool show_vwap = input.bool(false, "Show VWAP", group="Visual")
+bool show_signals = input.bool(true, "Show Breakout Signals", group="Visual")
+
+// Pivot detection
+float pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+float pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
+
+// Last confirmed pivot levels
+var float last_high = na
+var float last_low = na
+
+if not na(pivot_high)
+    last_high := pivot_high
+
+if not na(pivot_low)
+    last_low := pivot_low
+
+// Volume
+float vol_sma = ta.sma(volume, 20)
+
+// Intrabar momentum
+varip float bar_open = na
+
+if barstate.isnew
+    bar_open := open
+
+bool intra_mom_up = (close - bar_open) / bar_open > mom_threshold
+bool intra_mom_down = (close - bar_open) / bar_open < -mom_threshold
+bool volume_ok = volume > vol_sma * vol_multiplier
+
+// RSI and VWAP calculations
+// RSI is calculated but NOT plotted on the price chart
+float rsi = ta.rsi(close, 3)
+float vwap = ta.vwap(close)
+
+// Breakout conditions
+bool bullish_breakout = ta.crossover(close, last_high) and (use_filters ? volume_ok and intra_mom_up and rsi > 50 and close > vwap : true)
+
+bool bearish_breakout = ta.crossunder(close, last_low) and (use_filters ? volume_ok and intra_mom_down and rsi < 50 and close < vwap : true)
+
+// ATR
+float atr = ta.atr(14)
+
+// Long entry
+if bullish_breakout
+    strategy.entry("Long", strategy.long, comment="Bullish Breakout")
+    strategy.exit("Long Exit", "Long", limit=close + atr * tp_multiplier, stop=close - atr * sl_multiplier)
+    if strategy.position_size < 0
+        strategy.close("Short", comment="Close Short on Bullish Breakout")
+
+// Short entry
+if bearish_breakout
+    strategy.entry("Short", strategy.short, comment="Bearish Breakout")
+    strategy.exit("Short Exit", "Short", limit=close - atr * tp_multiplier, stop=close + atr * sl_multiplier)
+    if strategy.position_size > 0
+        strategy.close("Long", comment="Close Long on Bearish Breakout")
+
+// Breakout signals
+plotshape(show_signals and bullish_breakout, title="Bullish Breakout", location=location.belowbar, style=shape.triangleup, color=color.lime, size=size.small)
+
+plotshape(show_signals and bearish_breakout, title="Bearish Breakout", location=location.abovebar, style=shape.triangledown, color=color.red, size=size.small)
+
+// Support and resistance
+plot(show_levels ? last_high : na, title="Resistance", color=color.lime, style=plot.style_linebr, linewidth=1)
+
+plot(show_levels ? last_low : na, title="Support", color=color.red, style=plot.style_linebr, linewidth=1)
+
+// Optional VWAP
+plot(show_vwap ? vwap : na, title="VWAP", color=color.purple, linewidth=2)

@@ -1,0 +1,61 @@
+{
+  "region": {
+    "left": 0,
+    "top": 0,
+    "width": 100,
+    "height": 400
+  },
+  "scan_bound_chart": true,
+  "red_rgb": [
+    255,
+    167,
+    38
+  ],
+  "green_rgb": [
+    38,
+    198,
+    218
+  ],
+  "tolerance": 25,
+  "min_pixels": 12,
+  "buy_btn": null,
+  "sell_btn": null,
+  "use_ticket": false,
+  "confirm_btn": null,
+  "confirm_buy_rgb": null,
+  "confirm_sell_rgb": null,
+  "tp_toggle": null,
+  "sl_toggle": null,
+  "tp_enabled_rgb": null,
+  "sl_enabled_rgb": null,
+  "ticket_color_tolerance": 35,
+  "ticket_timeout_ms": 1500,
+  "ticket_settle_ms": 60,
+  "fill_sltp": false,
+  "tp_field": null,
+  "sl_field": null,
+  "tp_value": "20",
+  "sl_value": "20",
+  "cooldown_sec": 5,
+  "poll_ms": 5,
+  "position_guard": {
+    "accounts": [
+      {
+        "account": "YOUR_PAPER_ACCOUNT",
+        "broker": "Paper Trading"
+      },
+      {
+        "account": "YOUR_TRADOVATE_ACCOUNT",
+        "broker": "Tradovate"
+      }
+    ],
+    "window_title": "YOUR_LAYOUT_TITLE",
+    "page_url": "https://www.tradingview.com/chart/YOUR_LAYOUT_ID/",
+    "chart_name": "Chart #4",
+    "chart_description": "Chart for CME_MINI:NQ1!, 1 second",
+    "chart_descriptions": [
+      "Chart for CME_MINI:NQ1!, 1 second",
+      "Chart for CME_MINI:NQZ2026, 1 second"
+    ]
+  }
+}

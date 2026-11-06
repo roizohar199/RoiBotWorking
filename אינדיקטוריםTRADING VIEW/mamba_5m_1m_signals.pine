@@ -1,0 +1,380 @@
+//@version=6
+indicator("Mamba 5M / 1M - Video Rules v1.3", shorttitle="Mamba 5M/1M v1.3", overlay=true, max_bars_back=1000)
+
+// Source: https://www.youtube.com/watch?v=h-Z7CEqBO3s
+// 00:46-03:26: 5M S/R reaction, then 1M HH/HL + breakout.
+// 06:00-08:41: 5M resistance, then 1M trendline/support breaks.
+// Zone widths, pivot lengths, expiry and entry timing are explicit engineering
+// choices, NOT numerical rules provided by the speaker. No proven win rate.
+// Indicators execute on updates automatically; no broker or market-data API.
+
+string timing = input.string("Confirmed 1M close", "Signal timing", options=["Confirmed 1M close", "Live breakout"], group="Signals", tooltip="Confirmed: deliver a completed 1-minute signal at the next minute's first update. Live: act on observed price immediately; intrabar signals can differ after reload, especially on a 1-minute chart.")
+string entry_rule = input.string("Structure or trendline", "Entry pattern", options=["Structure or trendline", "Structure only", "Trendline + horizontal level"], group="Signals")
+int entry_pivot = input.int(2, "1M pivot left/right bars", minval=1, maxval=10, group="Signals", tooltip="A pivot becomes available only after this many subsequent 1-minute candles close. Signals are never moved back onto the pivot candle.")
+int setup_age = input.int(30, "Maximum 1M setup age (minutes)", minval=3, maxval=240, group="Signals")
+int buffer_ticks = input.int(1, "Breakout buffer (ticks)", minval=0, maxval=100, group="Signals")
+
+string zone_mode = input.string("Automatic", "5M zone source", options=["Automatic", "Manual prices"], group="5M context", tooltip="Automatic uses confirmed pivots and separated rejection candles. Manual lets you provide the support/resistance you would mark while watching the video.")
+float manual_support = input.price(0.0, "Manual support (0 = disabled)", group="5M context")
+float manual_resistance = input.price(0.0, "Manual resistance (0 = disabled)", group="5M context")
+int zone_pivot = input.int(2, "5M pivot left bars", minval=1, maxval=10, group="5M context")
+int zone_right = input.int(1, "5M pivot confirmation bars", minval=1, maxval=10, group="5M context", tooltip="One completed 5M candle confirms a candidate pivot. A rejection at an already known zone does not wait for a new pivot. No backdated signals.")
+float zone_width = input.float(0.20, "Zone half-width / 5M ATR(14)", minval=0.01, step=0.05, group="5M context")
+int min_touches = input.int(1, "Minimum separated rejection candles", minval=1, maxval=10, group="5M context", tooltip="Default: one confirmed rejection. Use 2 or more to require repeated rejections. This is an implementation choice, not a proven profitability setting.")
+int touch_gap = input.int(1, "Minimum 5M bars between rejections", minval=1, maxval=12, group="5M context")
+int bias_life = input.int(6, "Bias validity after rejection (5M bars)", minval=1, maxval=48, group="5M context")
+int zone_life = input.int(36, "Automatic zone lifetime (5M bars)", minval=6, maxval=240, group="5M context")
+
+bool show_zones = input.bool(true, "Show 5M zones", group="Display")
+bool show_trigger = input.bool(true, "Show armed 1M breakout level", group="Display")
+bool show_status = input.bool(true, "Show status panel", group="Display")
+color buy_color = input.color(color.rgb(38, 198, 218), "BUY triangle", group="Display")
+color sell_color = input.color(color.rgb(255, 167, 38), "SELL triangle", group="Display")
+
+if barstate.isfirst
+    if not chart.is_standard or not timeframe.isintraday or timeframe.in_seconds() > 60
+        runtime.error("Use standard candles on a 1-minute or seconds chart. The strategy always uses 5M context and 1M structure.")
+    if zone_life <= bias_life
+        runtime.error("Zone lifetime must be longer than bias validity.")
+    if zone_mode == "Manual prices" and manual_support <= 0 and manual_resistance <= 0
+        runtime.error("Set at least one positive manual support/resistance price.")
+    if zone_mode == "Manual prices" and manual_support > 0 and manual_resistance > 0 and manual_support >= manual_resistance
+        runtime.error("Manual support must be below manual resistance.")
+
+// Runs in 5M. Each zone has a fixed width from when it was created.
+// Rejections are counted at their actual close, never at an unconfirmed pivot.
+f_context() =>
+    float atr = ta.atr(14)
+    float pl = ta.pivotlow(low, zone_pivot, zone_right)
+    float ph = ta.pivothigh(high, zone_pivot, zone_right)
+    var float support = na
+    var float resistance = na
+    var float sw = na
+    var float rw = na
+    var int support_born = na
+    var int resistance_born = na
+    var int support_touches = 0
+    var int resistance_touches = 0
+    var int support_last_touch = na
+    var int resistance_last_touch = na
+    var int bias = 0
+    var int bias_bar = na
+    bool support_seed_rejection = false
+    bool resistance_seed_rejection = false
+
+    if zone_mode == "Automatic"
+        if not na(support) and (close < support - sw or bar_index - support_born > zone_life)
+            support := na
+            support_touches := 0
+            if bias == 1
+                bias := 0
+        if not na(resistance) and (close > resistance + rw or bar_index - resistance_born > zone_life)
+            resistance := na
+            resistance_touches := 0
+            if bias == -1
+                bias := 0
+        // Keep a qualified zone while its reaction is fresh. Once that reaction
+        // expires, a new confirmed pivot can refresh the zone instead of locking
+        // the context to the first qualified zone for the entire zone lifetime.
+        if not na(pl) and not na(atr[zone_right]) and (na(support) or math.abs(pl - support) > sw and (support_touches < min_touches or bar_index - support_last_touch >= bias_life))
+            support := pl
+            sw := math.max(syminfo.mintick, atr[zone_right] * zone_width)
+            support_born := bar_index
+            support_touches := close[zone_right] > support + sw ? 1 : 0
+            support_last_touch := support_touches > 0 ? bar_index - zone_right : na
+            // The seed rejection is actionable only NOW, after confirmation,
+            // and only if the confirming candle still closes beyond the zone.
+            support_seed_rejection := support_touches > 0 and close > support + sw
+        if not na(ph) and not na(atr[zone_right]) and (na(resistance) or math.abs(ph - resistance) > rw and (resistance_touches < min_touches or bar_index - resistance_last_touch >= bias_life))
+            resistance := ph
+            rw := math.max(syminfo.mintick, atr[zone_right] * zone_width)
+            resistance_born := bar_index
+            resistance_touches := close[zone_right] < resistance - rw ? 1 : 0
+            resistance_last_touch := resistance_touches > 0 ? bar_index - zone_right : na
+            resistance_seed_rejection := resistance_touches > 0 and close < resistance - rw
+    else
+        if na(support) and manual_support > 0 and not na(atr)
+            support := manual_support
+            sw := math.max(syminfo.mintick, atr * zone_width)
+            support_born := bar_index
+        if na(resistance) and manual_resistance > 0 and not na(atr)
+            resistance := manual_resistance
+            rw := math.max(syminfo.mintick, atr * zone_width)
+            resistance_born := bar_index
+        if not na(support) and close < support - sw
+            support_touches := 0
+            if bias == 1
+                bias := 0
+        if not na(resistance) and close > resistance + rw
+            resistance_touches := 0
+            if bias == -1
+                bias := 0
+
+    // Wick sweeps through the outer edge are allowed. The body must not start
+    // beyond that edge, and the candle must overlap and close clear of the zone.
+    // This excludes a gap entirely outside the zone and a body reclaim from
+    // below support/above resistance. Close-through invalidation remains above.
+    bool support_rejection = not na(support) and low <= support + sw and high >= support - sw and open >= support - sw and close > support + sw and (na(support_last_touch) or bar_index - support_last_touch >= touch_gap)
+    bool resistance_rejection = not na(resistance) and high >= resistance - rw and low <= resistance + rw and open <= resistance + rw and close < resistance - rw and (na(resistance_last_touch) or bar_index - resistance_last_touch >= touch_gap)
+    if support_rejection
+        support_touches += 1
+        support_last_touch := bar_index
+    if resistance_rejection
+        resistance_touches += 1
+        resistance_last_touch := bar_index
+    bool bullish_reaction = (support_rejection or support_seed_rejection) and support_touches >= min_touches
+    bool bearish_reaction = (resistance_rejection or resistance_seed_rejection) and resistance_touches >= min_touches
+    if bullish_reaction or bearish_reaction
+        bias := bullish_reaction and bearish_reaction ? 0 : bullish_reaction ? 1 : -1
+        bias_bar := bar_index
+    if not na(bias_bar) and bar_index - bias_bar >= bias_life
+        bias := 0
+    [bias, support, resistance, sw, rw, support_touches, resistance_touches]
+
+// lookahead_on is safe here ONLY because every exported HTF value is offset [1].
+f_context_closed() =>
+    [b, s, r, ws, wr, ns, nr] = f_context()
+    [b[1], s[1], r[1], ws[1], wr[1], ns[1], nr[1]]
+
+// Candidate data only: no lifecycle state or current-minute closing price is
+// exported. All geometry is available at the opening of the requested minute.
+// The single tracker below handles both chart timeframes and both timing modes.
+f_candidates() =>
+    [bias, support, resistance, sw, rw, ns, nr] = request.security(syminfo.tickerid, "5", f_context_closed(), lookahead=barmerge.lookahead_on)
+    float ph = ta.pivothigh(high, entry_pivot, entry_pivot)
+    float pl = ta.pivotlow(low, entry_pivot, entry_pivot)
+    var float h1 = na
+    var float h0 = na
+    var float l1 = na
+    var float l0 = na
+    var int ht1 = na
+    var int ht0 = na
+    var int lt1 = na
+    var int lt0 = na
+    if not na(ph)
+        h0 := h1
+        ht0 := ht1
+        h1 := ph
+        ht1 := time[entry_pivot]
+    if not na(pl)
+        l0 := l1
+        lt0 := lt1
+        l1 := pl
+        lt1 := time[entry_pivot]
+    float last_high = h1[1]
+    float prev_high = h0[1]
+    float last_low = l1[1]
+    float prev_low = l0[1]
+    int high_time = ht1[1]
+    int prev_high_time = ht0[1]
+    int low_time = lt1[1]
+    int prev_low_time = lt0[1]
+    bool ready = not na(prev_high) and not na(prev_low) and time - math.min(high_time, low_time) <= setup_age * 60000
+    bool higher_low = ready and last_low > prev_low and low_time > high_time
+    bool lower_high = ready and last_high < prev_high and high_time > low_time
+    bool long_structure = higher_low and last_high > prev_high
+    bool short_structure = lower_high and last_low < prev_low
+    bool falling_line = ready and last_high < prev_high and high_time > prev_high_time
+    bool rising_line = ready and last_low > prev_low and low_time > prev_low_time
+    bool long_line = falling_line and higher_low
+    bool short_line = rising_line and lower_high
+    bool allow_structure = entry_rule != "Trendline + horizontal level"
+    bool allow_line = entry_rule != "Structure only"
+    bool long_pattern = allow_structure and long_structure or allow_line and long_line
+    bool short_pattern = allow_structure and short_structure or allow_line and short_line
+    int long_kind = allow_structure and long_structure ? 1 : entry_rule == "Trendline + horizontal level" ? 3 : 2
+    int short_kind = allow_structure and short_structure ? 1 : entry_rule == "Trendline + horizontal level" ? 3 : 2
+    [ready, long_pattern, short_pattern, long_kind, short_kind, last_high, last_low, prev_high, prev_low, high_time, low_time, prev_high_time, prev_low_time, time, close[1], bias, support, resistance, sw, rw, ns, nr]
+
+// Kind 1: fixed horizontal level. Kind 2: extrapolate the SAME two anchors.
+// Kind 3: require both the frozen horizontal level and the anchored trendline.
+f_setup_level(int side, int kind, float horizontal, float y0, int t0, float y1, int t1, int at_time, float gap) =>
+    float line_value = t1 > t0 ? y1 + (y1 - y0) * (at_time - t1) / (t1 - t0) : na
+    float base = horizontal
+    if kind != 1
+        base := line_value
+        if kind == 3
+            base := side == 1 ? math.max(horizontal, line_value) : math.min(horizontal, line_value)
+    base + side * gap
+
+// Codes 1/2/3/4/5: stale or missing pivots / no pattern / invalid / consumed / late.
+f_candidate_block(bool ready, bool pattern, float previous_close, float protective, float level, int setup_id, int last_adopted, int side) =>
+    bool invalid = side == 1 ? previous_close <= protective : previous_close >= protective
+    bool used = not na(last_adopted) and setup_id <= last_adopted
+    bool late = side == 1 ? previous_close > level : previous_close < level
+    int result = not ready ? 1 : not pattern ? 2 : invalid ? 3 : used ? 4 : late ? 5 : 0
+    result
+
+[geometry_ready, candidate_long_pattern, candidate_short_pattern, candidate_long_kind, candidate_short_kind, candidate_high, candidate_low, candidate_prev_high, candidate_prev_low, candidate_high_time, candidate_low_time, candidate_prev_high_time, candidate_prev_low_time, setup_minute, previous_close, bias, support, resistance, support_width, resistance_width, support_touches, resistance_touches] = request.security(syminfo.tickerid, "1", f_candidates(), lookahead=barmerge.lookahead_on)
+
+float gap = buffer_ticks * syminfo.mintick
+float candidate_long_level = f_setup_level(1, candidate_long_kind, candidate_high, candidate_prev_high, candidate_prev_high_time, candidate_high, candidate_high_time, setup_minute, gap)
+float candidate_short_level = f_setup_level(-1, candidate_short_kind, candidate_low, candidate_prev_low, candidate_prev_low_time, candidate_low, candidate_low_time, setup_minute, gap)
+
+// One tracker, advanced exactly once per source minute, even on seconds charts.
+// These fields are copied only when a NEW setup is adopted. New same-direction
+// pivots cannot move its horizontal target, protective swing, or line anchors.
+varip int tracked_side = 0
+varip int tracked_kind = 0
+varip int tracked_id = na
+varip int tracked_origin = na
+varip float tracked_horizontal = na
+varip float tracked_protective = na
+varip float tracked_y0 = na
+varip float tracked_y1 = na
+varip int tracked_t0 = na
+varip int tracked_t1 = na
+varip int last_adopted_long = na
+varip int last_adopted_short = na
+varip int processed_minute = na
+varip int minute_bias = 0
+// Exit codes: 0 active/none, 1 expired, 3 invalid, 4 signaled,
+// 5 crossed without permission, 6 replaced by newer opposite structure.
+varip int exit_code = 0
+varip int candle_signal = 0
+if barstate.isnew
+    candle_signal := 0
+
+bool fresh_buy = false
+bool fresh_sell = false
+bool new_source_minute = not na(setup_minute) and (na(processed_minute) or processed_minute != setup_minute)
+// BEGIN TRACKER: replayed against source code in tests/test_mamba_tracker.py.
+if new_source_minute
+    if tracked_side != 0
+        // Resolve the completed minute against ITS locked target and 5M bias.
+        // Never apply a newly confirmed opposite setup/bias retroactively.
+        float prior_level = f_setup_level(tracked_side, tracked_kind, tracked_horizontal, tracked_y0, tracked_t0, tracked_y1, tracked_t1, processed_minute, gap)
+        bool prior_invalid = tracked_side == 1 ? previous_close <= tracked_protective : previous_close >= tracked_protective
+        bool prior_crossed = tracked_side == 1 ? previous_close > prior_level : previous_close < prior_level
+        bool prior_fresh = processed_minute - tracked_origin <= setup_age * 60000
+        if prior_invalid
+            tracked_side := 0
+            exit_code := 3
+        else if timing == "Confirmed 1M close" and setup_minute - processed_minute == 60000 and prior_fresh and prior_crossed and minute_bias == tracked_side
+            fresh_buy := tracked_side == 1
+            fresh_sell := tracked_side == -1
+            tracked_side := 0
+            exit_code := 4
+        else if setup_minute - tracked_origin > setup_age * 60000
+            tracked_side := 0
+            exit_code := 1
+        else if setup_minute - processed_minute > 60000
+            tracked_side := 0
+            exit_code := 7
+        else if prior_crossed
+            tracked_side := 0
+            exit_code := 5
+        else if tracked_side == 1 and candidate_short_pattern and candidate_high_time > tracked_id or tracked_side == -1 and candidate_long_pattern and candidate_low_time > tracked_id
+            tracked_side := 0
+            exit_code := 6
+    // A released setup cannot re-arm on the same pullback ID. A newer valid
+    // candidate may be adopted, including one confirmed while the old one ran.
+    if tracked_side == 0
+        int new_long_block = f_candidate_block(geometry_ready, candidate_long_pattern, previous_close, candidate_low, candidate_long_level, candidate_low_time, last_adopted_long, 1)
+        int new_short_block = f_candidate_block(geometry_ready, candidate_short_pattern, previous_close, candidate_high, candidate_short_level, candidate_high_time, last_adopted_short, -1)
+        if new_long_block == 0
+            tracked_side := 1
+            tracked_kind := candidate_long_kind
+            tracked_id := candidate_low_time
+            tracked_origin := math.min(candidate_high_time, candidate_low_time)
+            tracked_horizontal := candidate_high
+            tracked_protective := candidate_low
+            tracked_y0 := candidate_prev_high
+            tracked_y1 := candidate_high
+            tracked_t0 := candidate_prev_high_time
+            tracked_t1 := candidate_high_time
+            last_adopted_long := candidate_low_time
+            exit_code := 0
+        else if new_short_block == 0
+            tracked_side := -1
+            tracked_kind := candidate_short_kind
+            tracked_id := candidate_high_time
+            tracked_origin := math.min(candidate_high_time, candidate_low_time)
+            tracked_horizontal := candidate_low
+            tracked_protective := candidate_high
+            tracked_y0 := candidate_prev_low
+            tracked_y1 := candidate_low
+            tracked_t0 := candidate_prev_low_time
+            tracked_t1 := candidate_low_time
+            last_adopted_short := candidate_high_time
+            exit_code := 0
+    processed_minute := setup_minute
+    minute_bias := bias
+
+float tracked_level = f_setup_level(tracked_side, tracked_kind, tracked_horizontal, tracked_y0, tracked_t0, tracked_y1, tracked_t1, setup_minute, gap)
+if timing == "Live breakout" and tracked_side != 0
+    bool live_invalid = tracked_side == 1 ? close <= tracked_protective : close >= tracked_protective
+    bool live_crossed = tracked_side == 1 ? close > tracked_level : close < tracked_level
+    if live_invalid
+        tracked_side := 0
+        exit_code := 3
+    else if bias == tracked_side and live_crossed
+        fresh_buy := tracked_side == 1
+        fresh_sell := tracked_side == -1
+        tracked_side := 0
+        exit_code := 4
+// END TRACKER
+
+int long_block = f_candidate_block(geometry_ready, candidate_long_pattern, previous_close, candidate_low, candidate_long_level, candidate_low_time, last_adopted_long, 1)
+int short_block = f_candidate_block(geometry_ready, candidate_short_pattern, previous_close, candidate_high, candidate_short_level, candidate_high_time, last_adopted_short, -1)
+float long_level = tracked_side == 1 ? tracked_level : na
+float short_level = tracked_side == -1 ? tracked_level : na
+if fresh_buy
+    candle_signal := 1
+if fresh_sell
+    candle_signal := -1
+
+plotshape(candle_signal == 1, title="BUY", style=shape.triangleup, location=location.belowbar, color=buy_color, size=size.small)
+plotshape(candle_signal == -1, title="SELL", style=shape.triangledown, location=location.abovebar, color=sell_color, size=size.small)
+plot(show_zones ? support + support_width : na, "5M support upper", color=color.new(color.teal, 60), style=plot.style_stepline)
+plot(show_zones ? support - support_width : na, "5M support lower", color=color.new(color.teal, 60), style=plot.style_stepline)
+plot(show_zones ? resistance + resistance_width : na, "5M resistance upper", color=color.new(color.orange, 60), style=plot.style_stepline)
+plot(show_zones ? resistance - resistance_width : na, "5M resistance lower", color=color.new(color.orange, 60), style=plot.style_stepline)
+plot(show_trigger ? long_level : na, "BUY breakout level", color=color.new(color.teal, 15), style=plot.style_linebr, linewidth=2)
+plot(show_trigger ? short_level : na, "SELL breakout level", color=color.new(color.orange, 15), style=plot.style_linebr, linewidth=2)
+plot(bias, "5M bias (+1 / 0 / -1)", display=display.data_window)
+
+alertcondition(fresh_buy, "Mamba BUY", "Mamba BUY | {{ticker}} | 5M context + 1M breakout | observed price {{close}}")
+alertcondition(fresh_sell, "Mamba SELL", "Mamba SELL | {{ticker}} | 5M context + 1M breakout | observed price {{close}}")
+
+f_block_text(int code, bool is_long) =>
+    code == 1 ? "WAIT 1M PIVOTS / FRESH SETUP" : code == 2 ? (is_long ? "WAIT LONG STRUCTURE" : "WAIT SHORT STRUCTURE") : code == 3 ? "PULLBACK INVALID" : code == 4 ? "WAIT NEW PULLBACK" : code == 5 ? "PRICE ALREADY PAST BREAK" : (is_long ? "WAIT BUY BREAK" : "WAIT SELL BREAK")
+
+// Show the FIRST executable tick satisfying the engine's strict > / < test.
+// Formatting an off-tick trendline directly with format.mintick could round it
+// across the threshold. Inclusive >= / <= labels avoid that ambiguity and also
+// include the buffer already applied to long_level / short_level in f_engine.
+f_trigger_price(float level, bool is_long) =>
+    float tick_index = level / syminfo.mintick
+    float trigger_tick = is_long ? math.floor(tick_index) + 1 : math.ceil(tick_index) - 1
+    trigger_tick * syminfo.mintick
+
+// Separate observation of 1M structure from permission to trade that structure.
+var table status = table.new(position.bottom_right, 2, 8, bgcolor=color.new(color.black, 15))
+if barstate.islast and show_status
+    color tone = bias == 1 ? color.teal : bias == -1 ? color.orange : color.gray
+    string context_text = bias == 1 ? "LONG ONLY" : bias == -1 ? "SHORT ONLY" : na(support) and na(resistance) ? "WAIT 5M ZONE" : "NO ACTIVE 5M REJECTION"
+    string kind_text = tracked_kind == 1 ? "LEVEL" : tracked_kind == 3 ? "LINE + LEVEL" : "LINE"
+    string structure_text = tracked_side == 1 ? "LONG LOCKED | " + kind_text : tracked_side == -1 ? "SHORT LOCKED | " + kind_text : not geometry_ready ? "WAIT 1M PIVOTS / FRESH SETUP" : "NO ACTIVE LOCKED SETUP"
+    int direction_block = bias == 1 ? long_block : short_block
+    string entry_text = tracked_side != 0 ? (bias != tracked_side ? "BLOCKED BY 5M CONTEXT" : tracked_side == 1 ? "WAIT BUY BREAK" : "WAIT SELL BREAK") : exit_code == 1 ? "SETUP EXPIRED" : exit_code == 3 ? "LOCKED PULLBACK INVALID" : exit_code == 4 ? "SIGNAL SENT / WAIT NEW SETUP" : exit_code == 5 ? "BREAK MISSED / WAIT NEW SETUP" : exit_code == 7 ? "SOURCE GAP / WAIT NEW SETUP" : f_block_text(direction_block, bias == 1)
+    bool long_price_active = tracked_side == 1
+    bool short_price_active = tracked_side == -1
+    string long_price_text = long_price_active ? str.tostring(f_trigger_price(long_level, true), format.mintick) + (bias != 1 ? " | 5M BLOCK" : "") : "--"
+    string short_price_text = short_price_active ? str.tostring(f_trigger_price(short_level, false), format.mintick) + (bias != -1 ? " | 5M BLOCK" : "") : "--"
+    table.cell(status, 0, 0, "MAMBA VIDEO v1.3", text_color=color.silver)
+    table.cell(status, 1, 0, "5M -> 1M", text_color=color.silver)
+    table.cell(status, 0, 1, "5M context", text_color=color.silver)
+    table.cell(status, 1, 1, context_text, text_color=tone)
+    table.cell(status, 0, 2, "1M structure", text_color=color.silver)
+    table.cell(status, 1, 2, structure_text, text_color=color.silver)
+    table.cell(status, 0, 3, "Entry gate", text_color=color.silver)
+    table.cell(status, 1, 3, entry_text, text_color=tone)
+    table.cell(status, 0, 4, "Timing", text_color=color.silver)
+    table.cell(status, 1, 4, timing, text_color=color.silver)
+    table.cell(status, 0, 5, "5M rejections S / R", text_color=color.silver)
+    table.cell(status, 1, 5, str.tostring(support_touches) + " / " + str.tostring(resistance_touches) + " (need " + str.tostring(min_touches) + ")", text_color=color.silver)
+    table.cell(status, 0, 6, "Long trigger >=", text_color=buy_color)
+    table.cell(status, 1, 6, long_price_text, text_color=long_price_active and bias == 1 ? buy_color : color.silver)
+    table.cell(status, 0, 7, "Short trigger <=", text_color=sell_color)
+    table.cell(status, 1, 7, short_price_text, text_color=short_price_active and bias == -1 ? sell_color : color.silver)

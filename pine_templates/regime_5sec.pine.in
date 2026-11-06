@@ -1,0 +1,157 @@
+//@version=6
+strategy("__TITLE__", overlay=true, scale=scale.none, calc_on_every_tick=true, pyramiding=0, default_qty_type=strategy.fixed, default_qty_value=1)
+
+// Experimental, untuned regime filter. Not a demonstrated profitable strategy.
+// Only the simulator uses these exits/position checks. Python One-click orders
+// still use the TradingView preset and the actual account can differ.
+// Fixed profit/loss arguments below are TICKS FROM THE SIMULATED FILL.
+// Cost defaults match the supplied zero-commission Paper Trading export;
+// configure commission/slippage in Properties before interpreting a backtest.
+const bool REVERSED = __REVERSED__
+const string VERSION_TAG = "__TAG__"
+
+bool use_market_filters = input.bool(true, "Use Experimental Market Filters", group="Market")
+int fast_length = input.int(20, "Fast EMA Bars", minval=2, group="Market")
+int slow_length = input.int(50, "Slow EMA Bars", minval=3, group="Market")
+int er_length = input.int(20, "Efficiency Ratio Bars", minval=2, group="Market")
+float trend_min_er = input.float(0.35, "Trend: Minimum Efficiency", minval=0.0, maxval=1.0, step=0.05, group="Market")
+float range_max_er = input.float(0.25, "Range: Maximum Efficiency", minval=0.0, maxval=1.0, step=0.05, group="Market")
+int slope_bars = input.int(3, "EMA Slope Bars", minval=1, group="Market")
+float min_slope_atr = input.float(0.10, "Trend: Minimum EMA Slope / ATR", minval=0.0, step=0.05, group="Market")
+float range_gap_atr = input.float(0.50, "Range: Maximum EMA Gap / ATR", minval=0.0, step=0.05, group="Market")
+float min_stretch_atr = input.float(0.50, "Reversed: Minimum Stretch From Slow EMA / ATR", minval=0.0, step=0.05, group="Market")
+
+int atr_length = input.int(14, "ATR Bars", minval=2, group="Entry Quality")
+int atr_baseline_length = input.int(100, "ATR Baseline Bars", minval=10, group="Entry Quality")
+float min_atr_ratio = input.float(0.50, "Minimum ATR / Baseline", minval=0.0, step=0.1, group="Entry Quality")
+float max_atr_ratio = input.float(2.00, "Maximum ATR / Baseline", minval=0.1, step=0.1, group="Entry Quality")
+float max_bar_atr = input.float(2.50, "Maximum Candle Range / ATR", minval=0.1, step=0.1, group="Entry Quality")
+float max_chase_atr = input.float(0.50, "Maximum Distance Beyond Pivot / ATR", minval=0.0, step=0.05, group="Entry Quality")
+
+int pivot_left = input.int(1, "Left Pivot Bars", minval=1, group="Signal")
+int pivot_right = input.int(1, "Right Pivot Bars", minval=1, group="Signal")
+bool confirm_on_close = input.bool(true, "Confirm Signals On Bar Close", group="Signal", tooltip="Default: wait for a completed 5-second candle. Turning this off permits intrabar signals that can differ after reload.")
+bool use_extra_filters = input.bool(false, "Use Additional RSI / VWAP / Volume Filters", group="Signal")
+float vol_multiplier = input.float(1.5, "Volume Surge Multiplier", minval=1.0, group="Signal")
+int momentum_ticks = input.int(1, "Minimum Candle Move (ticks)", minval=0, group="Signal", tooltip="Used only by the additional filters. This is ticks, not a percentage of the index price.")
+
+int tp_ticks = input.int(20, "SIM Take Profit (ticks)", minval=1, group="Simulation")
+int sl_ticks = input.int(20, "SIM Stop Loss (ticks)", minval=1, group="Simulation")
+bool show_levels = input.bool(true, "Show Support / Resistance", group="Visual")
+bool show_vwap = input.bool(false, "Show VWAP", group="Visual")
+bool show_signals = input.bool(true, "Show BUY / SELL Triangles", group="Visual")
+bool show_status = input.bool(true, "Show Market Status (bottom left)", group="Visual")
+color buy_signal_color = input.color(color.rgb(38, 198, 218), "BUY Signal Color", group="Visual")
+color sell_signal_color = input.color(color.rgb(255, 167, 38), "SELL Signal Color", group="Visual")
+
+bool tf_ok = timeframe.isseconds and timeframe.multiplier == 5
+if barstate.isfirst
+    if not tf_ok
+        runtime.error("Use this experimental strategy on a 5-second chart.")
+    if range_max_er >= trend_min_er or fast_length >= slow_length or min_atr_ratio >= max_atr_ratio
+        runtime.error("Use range efficiency < trend efficiency, fast EMA < slow EMA, and minimum ATR ratio < maximum.")
+
+// Use the last COMPLETED candle for market classification. No future bars or
+// request.security lookahead are used. Current close is only the signal price.
+float atr_series = ta.atr(atr_length)
+float atr_ref = atr_series[1]
+float atr_baseline = ta.sma(atr_series, atr_baseline_length)[1]
+float fast_series = ta.ema(close, fast_length)
+float slow_series = ta.ema(close, slow_length)
+float ema_fast = fast_series[1]
+float ema_slow = slow_series[1]
+float path_length = ta.sma(math.abs(ta.change(close)), er_length) * er_length
+float er_series = path_length > 0 ? math.min(1.0, math.abs(close - close[er_length]) / path_length) : 0.0
+float efficiency = er_series[1]
+float slope_atr = atr_ref > 0 ? (fast_series[1] - fast_series[1 + slope_bars]) / atr_ref : na
+float atr_ratio = atr_baseline > 0 ? atr_ref / atr_baseline : na
+bool ready = not na(atr_ref) and atr_ref > 0 and not na(atr_ratio) and not na(ema_slow) and not na(efficiency) and not na(slope_atr)
+
+bool trend_up = efficiency >= trend_min_er and ema_fast > ema_slow and slope_atr >= min_slope_atr
+bool trend_down = efficiency >= trend_min_er and ema_fast < ema_slow and slope_atr <= -min_slope_atr
+bool range_market = efficiency <= range_max_er and math.abs(ema_fast - ema_slow) <= range_gap_atr * atr_ref
+bool volatility_ok = atr_ratio >= min_atr_ratio and atr_ratio <= max_atr_ratio and high - low <= max_bar_atr * atr_ref
+bool trend_buy_ok = trend_up and close > ema_fast
+bool trend_sell_ok = trend_down and close < ema_fast
+bool range_buy_ok = range_market and close <= ema_slow - min_stretch_atr * atr_ref
+bool range_sell_ok = range_market and close >= ema_slow + min_stretch_atr * atr_ref
+
+float pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+float pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
+var float last_high = na
+var float last_low = na
+if barstate.isconfirmed and not na(pivot_high)
+    last_high := pivot_high
+if barstate.isconfirmed and not na(pivot_low)
+    last_low := pivot_low
+
+float rsi = ta.rsi(close, 3)
+float vwap = ta.vwap(close)
+float vol_sma = ta.sma(volume, 20)
+float move_ticks = (close - open) / syminfo.mintick
+bool volume_ok = not na(volume) and not na(vol_sma) and volume > vol_sma * vol_multiplier
+bool extra_bull_ok = not use_extra_filters or (volume_ok and move_ticks >= momentum_ticks and rsi > 50 and close > vwap)
+bool extra_bear_ok = not use_extra_filters or (volume_ok and move_ticks <= -momentum_ticks and rsi < 50 and close < vwap)
+bool bullish_cross = ta.crossover(close, last_high)
+bool bearish_cross = ta.crossunder(close, last_low)
+bool bullish_breakout = bullish_cross and extra_bull_ok
+bool bearish_breakout = bearish_cross and extra_bear_ok
+bool bullish_chase_ok = close - last_high <= max_chase_atr * atr_ref
+bool bearish_chase_ok = last_low - close <= max_chase_atr * atr_ref
+
+bool requested_buy = REVERSED ? bearish_breakout : bullish_breakout
+bool requested_sell = REVERSED ? bullish_breakout : bearish_breakout
+bool buy_regime_ok = REVERSED ? range_buy_ok : trend_buy_ok
+bool sell_regime_ok = REVERSED ? range_sell_ok : trend_sell_ok
+bool buy_chase_ok = REVERSED ? bearish_chase_ok : bullish_chase_ok
+bool sell_chase_ok = REVERSED ? bullish_chase_ok : bearish_chase_ok
+bool buy_gate = not use_market_filters or (volatility_ok and buy_regime_ok and buy_chase_ok)
+bool sell_gate = not use_market_filters or (volatility_ok and sell_regime_ok and sell_chase_ok)
+
+varip int signal_direction = 0
+if barstate.isnew
+    signal_direction := 0
+// A SIM position check can reduce repeated markers; it does not read the
+// actual Paper Trading position and must not be treated as an account guard.
+bool signal_allowed = ready and tf_ok and strategy.position_size == 0 and signal_direction == 0 and (not confirm_on_close or barstate.isconfirmed)
+bool buy_event = signal_allowed and requested_buy and buy_gate
+bool sell_event = signal_allowed and requested_sell and sell_gate
+if buy_event and not sell_event
+    signal_direction := 1
+    strategy.entry("Long", strategy.long, qty=1, comment=VERSION_TAG + " BUY")
+    strategy.exit("Long Exit", "Long", profit=tp_ticks, loss=sl_ticks)
+else if sell_event and not buy_event
+    signal_direction := -1
+    strategy.entry("Short", strategy.short, qty=1, comment=VERSION_TAG + " SELL")
+    strategy.exit("Short Exit", "Short", profit=tp_ticks, loss=sl_ticks)
+
+plotshape(show_signals and signal_direction == 1, title="BUY", location=location.belowbar, style=shape.triangleup, color=buy_signal_color, size=size.small)
+plotshape(show_signals and signal_direction == -1, title="SELL", location=location.abovebar, style=shape.triangledown, color=sell_signal_color, size=size.small)
+plot(show_levels ? last_high : na, title="Resistance", color=color.lime, style=plot.style_linebr, linewidth=1)
+plot(show_levels ? last_low : na, title="Support", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(show_vwap ? vwap : na, title="VWAP", color=color.purple, linewidth=2)
+
+// Export actual inputs/features with chart data for future paired analysis.
+float regime_code = not ready ? na : not volatility_ok ? 3 : trend_up ? 1 : trend_down ? -1 : range_market ? 0 : 2
+plot(regime_code, title="Regime (up=1 down=-1 range=0 pause=2 volatility=3)", display=display.data_window)
+plot(efficiency, title="Efficiency Ratio (previous closed bar)", display=display.data_window)
+plot(atr_ref, title="ATR (previous closed bar)", display=display.data_window)
+plot(atr_ratio, title="ATR / Baseline", display=display.data_window)
+plot(ema_fast, title="Fast EMA (previous closed bar)", display=display.data_window)
+plot(ema_slow, title="Slow EMA (previous closed bar)", display=display.data_window)
+plot(volume, title="Volume (analysis)", display=display.data_window)
+plot(buy_event and not sell_event ? 1 : 0, title="BUY Event", display=display.data_window)
+plot(sell_event and not buy_event ? 1 : 0, title="SELL Event", display=display.data_window)
+
+var table status = table.new(position.bottom_left, 2, 4)
+if barstate.islast and show_status
+    string regime_text = not ready ? "WARMUP" : not use_market_filters ? "FILTERS OFF" : not volatility_ok ? "VOLATILITY PAUSE" : trend_up ? "UP TREND" : trend_down ? "DOWN TREND" : range_market ? "RANGE" : "NEUTRAL PAUSE"
+    string signal_text = strategy.position_size != 0 ? "SIM POSITION OPEN" : confirm_on_close and not barstate.isconfirmed ? "WAIT BAR CLOSE" : (requested_buy and not buy_gate) or (requested_sell and not sell_gate) ? "FILTERED" : "WAIT BREAKOUT"
+    table.cell(status, 0, 0, VERSION_TAG, text_color=color.silver, bgcolor=color.new(color.black, 20))
+    table.cell(status, 1, 0, "EXPERIMENTAL", text_color=color.silver, bgcolor=color.new(color.black, 20))
+    table.cell(status, 0, 1, "Market", text_color=color.silver, bgcolor=color.new(color.black, 20))
+    table.cell(status, 1, 1, regime_text, text_color=color.silver, bgcolor=color.new(color.black, 20))
+    table.cell(status, 0, 2, "Signal", text_color=color.silver, bgcolor=color.new(color.black, 20))
+    table.cell(status, 1, 2, signal_text, text_color=color.silver, bgcolor=color.new(color.black, 20))
+    table.cell(status, 0, 3, "SIM TP / SL ticks", text_color=color.silver, bgcolor=color.new(color.black, 20))
+    table.cell(status, 1, 3, str.tostring(tp_ticks) + " / " + str.tostring(sl_ticks), text_color=color.silver, bgcolor=color.new(color.black, 20))

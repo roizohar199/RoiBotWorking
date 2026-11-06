@@ -1,0 +1,9 @@
+py nq_triangle_bot.py run
+
+
+יש פקודה חדשה כולל המתנה ל3 נרות של שניה
+py nq_triangle_bot.py run --strategy 1sec-after-3bars
+
+
+יש פקודה חדשה יותר שגם מרסטת את הנעילה במידה והבוט ננעל מסיבה כל שהיא
+py nq_triangle_bot.py run --strategy 1sec-after-3bars --reset-position-lock

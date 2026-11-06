@@ -1,0 +1,116 @@
+@version=6
+strategy(Instant Breakout RSI & VWAP - 1s - After 3 Bars v1.0, shorttitle=IB 1s AFTER 3 BARS, overlay=true, scale=scale.none, calc_on_every_tick=true)
+
+ Original Visual Fix breakout rules and 33 pivot defaults. ONLY a 1-second
+ standard chart is supported. No wall-clock timer or synthetic missing bars.
+ A closed source-signal candle is bar N. Count the THREE completed chart
+ candles N+1, N+2, N+3. Deliver at the first update of N+4, not back on N+3.
+ Only delayed entry triangles use the screen bot's BUY  SELL colours.
+ Pine strategy orders simulate fills; they do not configure broker exits.
+
+int pivot_left = input.int(3, Left Pivot Bars, minval=1)
+int pivot_right = input.int(3, Right Pivot Bars, minval=1)
+float vol_multiplier = input.float(1.5, Volume Surge Multiplier, minval=1.0)
+float mom_threshold = input.float(0.01, Momentum Threshold, minval=0.0)
+float tp_multiplier = input.float(9.0, Take-Profit ATR Multiplier, minval=0.5)
+float sl_multiplier = input.float(1.0, Stop-Loss ATR Multiplier, minval=0.5)
+bool use_filters = input.bool(false, Use VolumeMomentum Filters)
+const int WAIT_BARS = 3
+
+bool show_levels = input.bool(true, Show Support  Resistance, group=Visual)
+bool show_vwap = input.bool(false, Show VWAP, group=Visual)
+bool show_signals = input.bool(true, Show Delayed Entry Triangles, group=Visual)
+bool show_status = input.bool(true, Show Candle Count, group=Visual)
+color buy_signal_color = input.color(color.rgb(38, 198, 218), BUY Signal Color, group=Visual)
+color sell_signal_color = input.color(color.rgb(255, 167, 38), SELL Signal Color, group=Visual)
+
+if barstate.isfirst and (not chart.is_standard or not timeframe.isseconds or timeframe.multiplier != 1)
+    runtime.error(Use standard 1-second candles. This script counts 3 completed candles AFTER the source-signal candle.)
+
+float pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+float pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
+var float last_high = na
+var float last_low = na
+if barstate.isconfirmed and not na(pivot_high)
+    last_high = pivot_high
+if barstate.isconfirmed and not na(pivot_low)
+    last_low = pivot_low
+
+float vol_sma = ta.sma(volume, 20)
+bool intra_mom_up = (close - open)  open  mom_threshold
+bool intra_mom_down = (close - open)  open  -mom_threshold
+bool volume_ok = volume  vol_sma  vol_multiplier
+float rsi = ta.rsi(close, 3)
+float vwap = ta.vwap(close)
+float atr = ta.atr(14)
+bool bullish_cross = ta.crossover(close, last_high)
+bool bearish_cross = ta.crossunder(close, last_low)
+bool bullish_breakout = bullish_cross and (use_filters  volume_ok and intra_mom_up and rsi  50 and close  vwap  true)
+bool bearish_breakout = bearish_cross and (use_filters  volume_ok and intra_mom_down and rsi  50 and close  vwap  true)
+
+ Read ONLY the just-completed source candle. Original Visual Fix also used
+ closed-bar strategy execution. An unconfirmed intrabar cross cannot queue.
+int raw_side = bullish_breakout[1]  1  bearish_breakout[1]  -1  0
+varip int processed_bar = na
+varip int pending_side = 0
+varip int pending_origin = na
+varip int entry_side = 0
+varip int delivered_origin = na
+varip int completed_bars = 0
+bool source_bar_ready = na(processed_bar) or processed_bar != bar_index
+bool fresh_buy = false
+bool fresh_sell = false
+
+ BEGIN THREE BAR QUEUE production block replayed by Python policy tests.
+if source_bar_ready
+    entry_side = 0
+     If updates skipped existing chart bars, discard the old pending order.
+     A wall-time gap with no chart candles does NOT increase bar_index.
+    if not na(processed_bar) and bar_index - processed_bar  1
+        pending_side = 0
+        pending_origin = na
+     Latest opposite signal takes priority even at the delivery boundary.
+     A repeat in the SAME direction never postpones the original countdown.
+    if raw_side != 0 and (pending_side == 0 or raw_side != pending_side)
+        pending_side = raw_side
+        pending_origin = bar_index - 1
+    completed_bars = pending_side != 0  bar_index - pending_origin - 1  0
+    if pending_side != 0 and completed_bars = WAIT_BARS
+        entry_side = pending_side
+        delivered_origin = pending_origin
+        fresh_buy = entry_side == 1
+        fresh_sell = entry_side == -1
+        pending_side = 0
+        pending_origin = na
+    processed_bar = bar_index
+ END THREE BAR QUEUE
+
+ Submit once; keep the bot's triangle visible throughout the delivery candle.
+ Simulator market fills occur on its next eligible tick, not at the old signal
+ price. TPSL reference the delivery price, preserving the original ATR ratios.
+if fresh_buy
+    strategy.entry(Long, strategy.long, comment=BUY after 3 closed 1s bars)
+    strategy.exit(Long Exit, Long, limit=close + atr  tp_multiplier, stop=close - atr  sl_multiplier)
+else if fresh_sell
+    strategy.entry(Short, strategy.short, comment=SELL after 3 closed 1s bars)
+    strategy.exit(Short Exit, Short, limit=close - atr  tp_multiplier, stop=close + atr  sl_multiplier)
+
+plotshape(show_signals and entry_side == 1, title=BUY after 3 bars, location=location.belowbar, style=shape.triangleup, color=buy_signal_color, size=size.small)
+plotshape(show_signals and entry_side == -1, title=SELL after 3 bars, location=location.abovebar, style=shape.triangledown, color=sell_signal_color, size=size.small)
+plot(show_levels  last_high  na, title=Resistance, color=color.lime, style=plot.style_linebr, linewidth=1)
+plot(show_levels  last_low  na, title=Support, color=color.red, style=plot.style_linebr, linewidth=1)
+plot(show_vwap  vwap  na, title=VWAP, color=color.purple, linewidth=2)
+plot(raw_side, Closed source signal (+1  -1), display=display.data_window)
+plot(pending_side, Pending direction (+1  -1), display=display.data_window)
+plot(completed_bars, Completed candles after source, display=display.data_window)
+plot(entry_side, Delayed entry (+1  -1), display=display.data_window)
+plot(pending_origin, Pending source bar index, display=display.data_window)
+plot(delivered_origin, Last delivered source bar index, display=display.data_window)
+
+var table status = table.new(position.top_right, 2, 2, bgcolor=color.new(color.black, 15))
+if barstate.islast and show_status
+    string state_text = pending_side == 1  WAIT BUY  pending_side == -1  WAIT SELL  entry_side == 1  BUY READY  entry_side == -1  SELL READY  WAIT SIGNAL
+    table.cell(status, 0, 0, AFTER 3 CANDLES, text_color=color.silver)
+    table.cell(status, 1, 0, state_text, text_color=color.white)
+    table.cell(status, 0, 1, Closed after signal, text_color=color.silver)
+    table.cell(status, 1, 1, str.tostring(completed_bars) +   3, text_color=color.white)

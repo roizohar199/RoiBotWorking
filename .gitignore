@@ -1,0 +1,33 @@
+# Local account configuration and runtime reservations
+/nq_bot_config.json
+/nq_bot_position_state.json
+/nq_bot_single_instance.lock
+
+# Trading journals, screenshots, recordings and local calibration
+/nq_bot_logs/
+/nq_bot_diagnostics/
+/analysis/
+/כיול האוטומציה/
+*.bak
+*.tmp
+*.log
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Credentials and editor/OS files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store

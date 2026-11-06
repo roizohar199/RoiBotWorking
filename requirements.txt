@@ -1,0 +1,6 @@
+mss
+pyautogui
+numpy
+keyboard
+uiautomation==2.0.29
+comtypes==1.4.17

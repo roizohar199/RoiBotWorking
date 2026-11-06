@@ -1,0 +1,89 @@
+//@version=6
+strategy("Instant Breakout Strategy with RSI & VWAP - Visual Fix - 5sec", overlay=true, scale=scale.none, calc_on_every_tick=true)
+
+// 5sec variant. Apply to a 5-second chart.
+// Fast mode can signal before the candle closes. Intrabar signals may differ
+// after a reload, because historical bars do not preserve all realtime ticks.
+// This strategy does not configure or verify the Python bot's Paper Trading exits.
+
+// Inputs: only the pivot defaults were shortened for the 5-second chart.
+int pivot_left = input.int(1, "Left Pivot Bars", minval=1)
+int pivot_right = input.int(1, "Right Pivot Bars", minval=1)
+float vol_multiplier = input.float(1.5, "Volume Surge Multiplier", minval=1.0)
+float mom_threshold = input.float(0.01, "Momentum Threshold", minval=0.0, tooltip="Fraction of the candle open: 0.01 = 1%. Used only when filters are enabled.")
+float tp_multiplier = input.float(9.0, "Take-Profit ATR Multiplier", minval=0.5)
+float sl_multiplier = input.float(1.0, "Stop-Loss ATR Multiplier", minval=0.5)
+bool use_filters = input.bool(false, "Use Volume/Momentum Filters")
+bool confirm_on_close = input.bool(false, "Confirm Signals On Bar Close", tooltip="Off: react during the live candle and keep its first signal visible. On: require the candle to close before signaling.")
+
+// Visual settings. Signal colours match the current Python bot calibration.
+bool show_levels = input.bool(true, "Show Support / Resistance", group="Visual")
+bool show_vwap = input.bool(false, "Show VWAP", group="Visual")
+bool show_signals = input.bool(true, "Show Breakout Signals", group="Visual")
+color buy_signal_color = input.color(color.rgb(38, 198, 218), "BUY Signal Color", group="Visual")
+color sell_signal_color = input.color(color.rgb(255, 167, 38), "SELL Signal Color", group="Visual")
+
+// Pivot detection. Commit levels on candle close so a provisional intrabar
+// pivot does not replace the last confirmed support/resistance level.
+float pivot_high = ta.pivothigh(high, pivot_left, pivot_right)
+float pivot_low = ta.pivotlow(low, pivot_left, pivot_right)
+var float last_high = na
+var float last_low = na
+
+if barstate.isconfirmed and not na(pivot_high)
+    last_high := pivot_high
+
+if barstate.isconfirmed and not na(pivot_low)
+    last_low := pivot_low
+
+// Volume and momentum. 'open' is already fixed for the current candle;
+// using it directly avoids a stale manually stored bar-open value.
+float vol_sma = ta.sma(volume, 20)
+float bar_open = open
+bool intra_mom_up = (close - bar_open) / bar_open > mom_threshold
+bool intra_mom_down = (close - bar_open) / bar_open < -mom_threshold
+bool volume_ok = volume > vol_sma * vol_multiplier
+
+// Original RSI, VWAP and ATR lengths are preserved.
+float rsi = ta.rsi(close, 3)
+float vwap = ta.vwap(close)
+float atr = ta.atr(14)
+
+// Evaluate the crossover functions on every calculation.
+bool bullish_cross = ta.crossover(close, last_high)
+bool bearish_cross = ta.crossunder(close, last_low)
+bool bullish_filters_ok = use_filters ? volume_ok and intra_mom_up and rsi > 50 and close > vwap : true
+bool bearish_filters_ok = use_filters ? volume_ok and intra_mom_down and rsi < 50 and close < vwap : true
+
+// Keep only the FIRST direction signaled on this candle. 'varip' preserves
+// the marker across live ticks, avoiding a disappearing/flashing triangle.
+// An opposite signal on the same candle is intentionally ignored.
+varip int signal_direction = 0
+if barstate.isnew
+    signal_direction := 0
+
+bool signal_allowed = signal_direction == 0 and (not confirm_on_close or barstate.isconfirmed)
+bool bullish_breakout = signal_allowed and bullish_cross and bullish_filters_ok
+bool bearish_breakout = signal_allowed and bearish_cross and bearish_filters_ok
+
+// Original signal-close/ATR exit formulas are preserved for the strategy
+// simulation. strategy.entry() already reverses an opposite simulated position,
+// so no second strategy.close() order is submitted for the same reversal.
+if bullish_breakout
+    signal_direction := 1
+    strategy.entry("Long", strategy.long, comment="Bullish Breakout 5sec")
+    strategy.exit("Long Exit", "Long", limit=close + atr * tp_multiplier, stop=close - atr * sl_multiplier)
+else if bearish_breakout
+    signal_direction := -1
+    strategy.entry("Short", strategy.short, comment="Bearish Breakout 5sec")
+    strategy.exit("Short Exit", "Short", limit=close - atr * tp_multiplier, stop=close + atr * sl_multiplier)
+
+// Signal markers remain on the signal candle while this script run continues.
+// Fast-mode markers are NOT guaranteed to survive historical recalculation.
+plotshape(show_signals and signal_direction == 1, title="Bullish Breakout", location=location.belowbar, style=shape.triangleup, color=buy_signal_color, size=size.small)
+plotshape(show_signals and signal_direction == -1, title="Bearish Breakout", location=location.abovebar, style=shape.triangledown, color=sell_signal_color, size=size.small)
+
+// Support / resistance and optional VWAP retain the original appearance.
+plot(show_levels ? last_high : na, title="Resistance", color=color.lime, style=plot.style_linebr, linewidth=1)
+plot(show_levels ? last_low : na, title="Support", color=color.red, style=plot.style_linebr, linewidth=1)
+plot(show_vwap ? vwap : na, title="VWAP", color=color.purple, linewidth=2)
